@@ -1,5 +1,74 @@
 const std = @import("std");
 
+pub const JobType = enum {
+    shell,
+    agent,
+
+    pub fn asStr(self: JobType) []const u8 {
+        return switch (self) {
+            .shell => "shell",
+            .agent => "agent",
+        };
+    }
+
+    pub fn parse(raw: []const u8) JobType {
+        if (std.ascii.eqlIgnoreCase(raw, "agent")) return .agent;
+        return .shell;
+    }
+};
+
+pub const SessionTarget = enum {
+    isolated,
+    main,
+
+    pub fn asStr(self: SessionTarget) []const u8 {
+        return switch (self) {
+            .isolated => "isolated",
+            .main => "main",
+        };
+    }
+
+    pub fn parse(raw: []const u8) SessionTarget {
+        if (std.ascii.eqlIgnoreCase(raw, "main")) return .main;
+        return .isolated;
+    }
+};
+
+pub const ScheduleKind = enum { cron, at, every };
+
+pub const Schedule = union(ScheduleKind) {
+    cron: struct { expr: []const u8, tz: ?[]const u8 },
+    at: struct { timestamp_s: i64 },
+    every: struct { every_ms: u64 },
+};
+
+pub const DeliveryConfig = struct {
+    mode: []const u8 = "none",
+    channel: ?[]const u8 = null,
+    to: ?[]const u8 = null,
+    best_effort: bool = true,
+};
+
+pub const CronRun = struct {
+    id: u64,
+    job_id: []const u8,
+    started_at_s: i64,
+    finished_at_s: i64,
+    status: []const u8,
+    output: ?[]const u8,
+    duration_ms: ?i64,
+};
+
+pub const CronJobPatch = struct {
+    expression: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    prompt: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    enabled: ?bool = null,
+    model: ?[]const u8 = null,
+    delete_after_run: ?bool = null,
+};
+
 /// A scheduled cron job.
 pub const CronJob = struct {
     id: []const u8,
@@ -10,6 +79,15 @@ pub const CronJob = struct {
     last_status: ?[]const u8 = null,
     paused: bool = false,
     one_shot: bool = false,
+    job_type: JobType = .shell,
+    session_target: SessionTarget = .isolated,
+    prompt: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    enabled: bool = true,
+    delete_after_run: bool = false,
+    created_at_s: i64 = 0,
+    last_output: ?[]const u8 = null,
 };
 
 /// Duration unit for "once" delay parsing.
@@ -87,6 +165,8 @@ pub const CronNormalized = struct {
 /// In-memory cron job store (no SQLite dependency for the minimal Zig port).
 pub const CronScheduler = struct {
     jobs: std.ArrayListUnmanaged(CronJob),
+    runs: std.ArrayListUnmanaged(CronRun) = .empty,
+    next_run_id: u64 = 1,
     max_tasks: usize,
     enabled: bool,
     allocator: std.mem.Allocator,
@@ -101,6 +181,12 @@ pub const CronScheduler = struct {
     }
 
     pub fn deinit(self: *CronScheduler) void {
+        for (self.runs.items) |r| {
+            self.allocator.free(r.job_id);
+            self.allocator.free(r.status);
+            if (r.output) |o| self.allocator.free(o);
+        }
+        self.runs.deinit(self.allocator);
         for (self.jobs.items) |job| {
             self.allocator.free(job.id);
             self.allocator.free(job.expression);
@@ -165,6 +251,86 @@ pub const CronScheduler = struct {
             if (std.mem.eql(u8, job.id, id)) return job;
         }
         return null;
+    }
+
+    /// Get a mutable pointer to a job by ID.
+    pub fn getMutableJob(self: *CronScheduler, id: []const u8) ?*CronJob {
+        for (self.jobs.items) |*job| {
+            if (std.mem.eql(u8, job.id, id)) return job;
+        }
+        return null;
+    }
+
+    /// Update a job's fields from a patch.
+    pub fn updateJob(self: *CronScheduler, allocator: std.mem.Allocator, id: []const u8, patch: CronJobPatch) bool {
+        const job = self.getMutableJob(id) orelse return false;
+        if (patch.expression) |expr| {
+            allocator.free(job.expression);
+            job.expression = allocator.dupe(u8, expr) catch return false;
+        }
+        if (patch.command) |cmd| {
+            allocator.free(job.command);
+            job.command = allocator.dupe(u8, cmd) catch return false;
+        }
+        if (patch.enabled) |ena| {
+            job.enabled = ena;
+            job.paused = !ena;
+        }
+        if (patch.delete_after_run) |d| {
+            job.delete_after_run = d;
+            job.one_shot = d;
+        }
+        return true;
+    }
+
+    /// Record a completed run for a job.
+    pub fn addRun(self: *CronScheduler, allocator: std.mem.Allocator, job_id: []const u8, started_at_s: i64, finished_at_s: i64, status: []const u8, output: ?[]const u8, max_history: usize) !void {
+        const entry = CronRun{
+            .id = self.next_run_id,
+            .job_id = try allocator.dupe(u8, job_id),
+            .started_at_s = started_at_s,
+            .finished_at_s = finished_at_s,
+            .status = try allocator.dupe(u8, status),
+            .output = if (output) |o| try allocator.dupe(u8, o) else null,
+            .duration_ms = (finished_at_s - started_at_s) * 1000,
+        };
+        self.next_run_id += 1;
+        try self.runs.append(allocator, entry);
+        // Prune to max_history per job_id
+        if (max_history > 0) {
+            var count: usize = 0;
+            var i: usize = self.runs.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.mem.eql(u8, self.runs.items[i].job_id, job_id)) {
+                    count += 1;
+                    if (count > max_history) {
+                        // Free strings of the pruned run
+                        allocator.free(self.runs.items[i].job_id);
+                        allocator.free(self.runs.items[i].status);
+                        if (self.runs.items[i].output) |o| allocator.free(o);
+                        _ = self.runs.orderedRemove(i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// List recent runs for a given job_id, up to `limit` entries.
+    pub fn listRuns(self: *const CronScheduler, job_id: []const u8, limit: usize) []const CronRun {
+        // Return last `limit` runs for given job_id (from end of slice)
+        var count: usize = 0;
+        var start: usize = self.runs.items.len;
+        var i: usize = self.runs.items.len;
+        while (i > 0 and count < limit) {
+            i -= 1;
+            if (std.mem.eql(u8, self.runs.items[i].job_id, job_id)) {
+                start = i;
+                count += 1;
+            }
+        }
+        if (count == 0) return &.{};
+        return self.runs.items[start..];
     }
 
     /// Remove a job by ID, freeing its owned strings.
@@ -529,6 +695,47 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     }
 }
 
+/// CLI: update a cron job's expression, command, or enabled state.
+pub fn cliUpdateJob(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    expression: ?[]const u8,
+    command: ?[]const u8,
+    enabled: ?bool,
+) !void {
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const patch = CronJobPatch{
+        .expression = expression,
+        .command = command,
+        .enabled = enabled,
+    };
+    if (scheduler.updateJob(allocator, id, patch)) {
+        try saveJobs(&scheduler);
+        std.debug.print("Updated job {s}\n", .{id});
+    } else {
+        std.debug.print("Cron job '{s}' not found\n", .{id});
+    }
+}
+
+/// CLI: list run history for a cron job.
+pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8) !void {
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    if (scheduler.getJob(id)) |job| {
+        std.debug.print("Run history for job {s} ({s}):\n", .{ id, job.command });
+        const status = job.last_status orelse "never run";
+        std.debug.print("  Last status: {s}\n", .{status});
+        std.debug.print("  Next run:    {d}\n", .{job.next_run_secs});
+    } else {
+        std.debug.print("Cron job '{s}' not found\n", .{id});
+    }
+}
+
 // ── Backwards-compatible type alias ──────────────────────────────────
 
 pub const Task = CronJob;
@@ -661,6 +868,102 @@ test "save and load roundtrip" {
     try std.testing.expectEqualStrings("*/10 * * * *", loaded[0].expression);
     try std.testing.expectEqualStrings("echo roundtrip", loaded[0].command);
     try std.testing.expect(loaded[1].one_shot);
+}
+
+test "JobType parse and asStr" {
+    try std.testing.expectEqual(JobType.shell, JobType.parse("shell"));
+    try std.testing.expectEqual(JobType.agent, JobType.parse("agent"));
+    try std.testing.expectEqual(JobType.agent, JobType.parse("AGENT"));
+    try std.testing.expectEqualStrings("shell", JobType.shell.asStr());
+    try std.testing.expectEqualStrings("agent", JobType.agent.asStr());
+}
+
+test "SessionTarget parse and asStr" {
+    try std.testing.expectEqual(SessionTarget.isolated, SessionTarget.parse("isolated"));
+    try std.testing.expectEqual(SessionTarget.main, SessionTarget.parse("main"));
+    try std.testing.expectEqual(SessionTarget.main, SessionTarget.parse("MAIN"));
+    try std.testing.expectEqualStrings("isolated", SessionTarget.isolated.asStr());
+    try std.testing.expectEqualStrings("main", SessionTarget.main.asStr());
+}
+
+test "CronJob has new fields" {
+    const job = CronJob{
+        .id = "test",
+        .expression = "* * * * *",
+        .command = "echo hi",
+        .job_type = .agent,
+        .session_target = .main,
+        .enabled = true,
+        .delete_after_run = false,
+        .created_at_s = 1000000,
+    };
+    try std.testing.expectEqual(JobType.agent, job.job_type);
+    try std.testing.expectEqual(SessionTarget.main, job.session_target);
+    try std.testing.expect(job.enabled);
+    try std.testing.expectEqual(@as(i64, 1000000), job.created_at_s);
+}
+
+test "getMutableJob returns mutable pointer" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("* * * * *", "echo test");
+    const jobs = scheduler.listJobs();
+    const id = jobs[0].id;
+    const job = scheduler.getMutableJob(id);
+    try std.testing.expect(job != null);
+    try std.testing.expectEqualStrings(id, job.?.id);
+}
+
+test "updateJob modifies job fields" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("* * * * *", "echo original");
+    const jobs = scheduler.listJobs();
+    const id = jobs[0].id;
+    const patch = CronJobPatch{ .command = "echo updated", .enabled = false };
+    try std.testing.expect(scheduler.updateJob(allocator, id, patch));
+    const updated = scheduler.getJob(id).?;
+    try std.testing.expectEqualStrings("echo updated", updated.command);
+    try std.testing.expect(!updated.enabled);
+    try std.testing.expect(updated.paused);
+}
+
+test "getMutableJob returns null for unknown id" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    try std.testing.expect(scheduler.getMutableJob("nonexistent") == null);
+}
+
+test "addRun and listRuns" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("* * * * *", "echo test");
+    const jobs = scheduler.listJobs();
+    const id = jobs[0].id;
+    try scheduler.addRun(allocator, id, 1000, 1001, "success", "output", 10);
+    try scheduler.addRun(allocator, id, 1001, 1002, "error", null, 10);
+    const runs = scheduler.listRuns(id, 10);
+    try std.testing.expect(runs.len > 0);
+}
+
+test "addRun prunes history" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("* * * * *", "echo test");
+    const jobs = scheduler.listJobs();
+    const id = jobs[0].id;
+    // Add 5 runs with max_history=3
+    var i: i64 = 0;
+    while (i < 5) : (i += 1) {
+        try scheduler.addRun(allocator, id, i, i + 1, "success", null, 3);
+    }
+    const runs = scheduler.listRuns(id, 100);
+    try std.testing.expect(runs.len <= 3);
 }
 
 test "cron module compiles" {}

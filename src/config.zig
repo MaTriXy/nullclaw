@@ -96,6 +96,12 @@ pub const HeartbeatConfig = struct {
     interval_minutes: u32 = 30,
 };
 
+pub const CronConfig = struct {
+    enabled: bool = false,
+    interval_minutes: u32 = 30,
+    max_run_history: u32 = 50,
+};
+
 // ── Channel configs ─────────────────────────────────────────────
 
 pub const TelegramConfig = struct {
@@ -394,6 +400,7 @@ pub const Config = struct {
     scheduler: SchedulerConfig = .{},
     agent: AgentConfig = .{},
     heartbeat: HeartbeatConfig = .{},
+    cron: CronConfig = .{},
     channels: ChannelsConfig = .{},
     memory: MemoryConfig = .{},
     tunnel: TunnelConfig = .{},
@@ -2127,6 +2134,18 @@ test "heartbeat config enabled" {
     const h = HeartbeatConfig{ .enabled = true, .interval_minutes = 15 };
     try std.testing.expect(h.enabled);
     try std.testing.expectEqual(@as(u32, 15), h.interval_minutes);
+}
+
+// ── Cron config ─────────────────────────────────────────────────
+
+test "CronConfig max_run_history default" {
+    const c = CronConfig{};
+    try std.testing.expectEqual(@as(u32, 50), c.max_run_history);
+}
+
+test "CronConfig max_run_history custom" {
+    const c = CronConfig{ .max_run_history = 100 };
+    try std.testing.expectEqual(@as(u32, 100), c.max_run_history);
 }
 
 // ── Memory config ───────────────────────────────────────────────

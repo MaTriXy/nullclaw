@@ -186,6 +186,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  pause <id>                    Pause a scheduled task
             \\  resume <id>                   Resume a paused task
             \\  run <id>                      Run a scheduled task immediately
+            \\  update <id> [options]         Update a cron job
+            \\  runs <id>                     List recent run history for a job
             \\
         , .{});
         std.process.exit(1);
@@ -231,6 +233,36 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.process.exit(1);
         }
         try yc.cron.cliRunJob(allocator, sub_args[1]);
+    } else if (std.mem.eql(u8, subcmd, "update")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--enable] [--disable]\n", .{});
+            std.process.exit(1);
+        }
+        const id = sub_args[1];
+        var expression: ?[]const u8 = null;
+        var command: ?[]const u8 = null;
+        var enabled: ?bool = null;
+        var i: usize = 2;
+        while (i < sub_args.len) : (i += 1) {
+            if (std.mem.eql(u8, sub_args[i], "--expression") and i + 1 < sub_args.len) {
+                i += 1;
+                expression = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--command") and i + 1 < sub_args.len) {
+                i += 1;
+                command = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--enable")) {
+                enabled = true;
+            } else if (std.mem.eql(u8, sub_args[i], "--disable")) {
+                enabled = false;
+            }
+        }
+        try yc.cron.cliUpdateJob(allocator, id, expression, command, enabled);
+    } else if (std.mem.eql(u8, subcmd, "runs")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw cron runs <id>\n", .{});
+            std.process.exit(1);
+        }
+        try yc.cron.cliListRuns(allocator, sub_args[1]);
     } else {
         std.debug.print("Unknown cron command: {s}\n", .{subcmd});
         std.process.exit(1);

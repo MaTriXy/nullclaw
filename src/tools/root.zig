@@ -25,6 +25,12 @@ pub const screenshot = @import("screenshot.zig");
 pub const browser_open = @import("browser_open.zig");
 pub const hardware_info = @import("hardware_info.zig");
 pub const hardware_memory = @import("hardware_memory.zig");
+pub const cron_add = @import("cron_add.zig");
+pub const cron_list = @import("cron_list.zig");
+pub const cron_remove = @import("cron_remove.zig");
+pub const cron_runs = @import("cron_runs.zig");
+pub const cron_run = @import("cron_run.zig");
+pub const cron_update = @import("cron_update.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 

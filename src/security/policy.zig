@@ -219,6 +219,9 @@ pub const SecurityPolicy = struct {
             return false;
         }
 
+        // Block single & background chaining (&& is allowed)
+        if (containsSingleAmpersand(command)) return false;
+
         // Block output redirections
         if (std.mem.indexOfScalar(u8, command, '>') != null) return false;
 
@@ -338,6 +341,20 @@ fn replacePair(buf: []u8, pat: *const [2]u8) void {
             i += 1;
         }
     }
+}
+
+/// Detect a single `&` operator (background/chain). `&&` is allowed.
+/// We treat any standalone `&` as unsafe because it enables background
+/// process chaining that can escape foreground timeout expectations.
+fn containsSingleAmpersand(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s, 0..) |b, i| {
+        if (b != '&') continue;
+        const prev_is_amp = i > 0 and s[i - 1] == '&';
+        const next_is_amp = i + 1 < s.len and s[i + 1] == '&';
+        if (!prev_is_amp and !next_is_amp) return true;
+    }
+    return false;
 }
 
 /// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`)
@@ -1032,4 +1049,32 @@ test "default forbidden paths includes sensitive dirs" {
     try std.testing.expect(found_etc);
     try std.testing.expect(found_ssh);
     try std.testing.expect(found_proc);
+}
+
+test "blocks single ampersand background chaining" {
+    var p = SecurityPolicy{ .autonomy = .supervised };
+    p.allowed_commands = &.{"ls"};
+    // single & should be blocked
+    try std.testing.expect(!p.isCommandAllowed("ls & ls"));
+    try std.testing.expect(!p.isCommandAllowed("ls &"));
+    try std.testing.expect(!p.isCommandAllowed("& ls"));
+}
+
+test "allows double ampersand and-and" {
+    var p = SecurityPolicy{ .autonomy = .supervised };
+    p.allowed_commands = &.{ "ls", "echo" };
+    // && should still be allowed (it's safe chaining)
+    try std.testing.expect(p.isCommandAllowed("ls && echo done"));
+}
+
+test "containsSingleAmpersand detects correctly" {
+    // These have single & -> should detect
+    try std.testing.expect(containsSingleAmpersand("cmd & other"));
+    try std.testing.expect(containsSingleAmpersand("cmd &"));
+    try std.testing.expect(containsSingleAmpersand("& cmd"));
+    // These do NOT have single & -> should NOT detect
+    try std.testing.expect(!containsSingleAmpersand("cmd && other"));
+    try std.testing.expect(!containsSingleAmpersand("cmd || other"));
+    try std.testing.expect(!containsSingleAmpersand("normal command"));
+    try std.testing.expect(!containsSingleAmpersand(""));
 }
